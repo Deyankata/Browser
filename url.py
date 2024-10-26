@@ -1,8 +1,13 @@
 import socket
 import ssl
 import os
+import time
+import gzip
+from urllib.parse import urljoin
 
 class URL:
+    cache = {}
+
     def __init__(self, url):
         # Data scheme for inline HTML support
         if url[:4] == "data":
@@ -39,7 +44,18 @@ class URL:
 
         self.path = "/" + url
     
-    def request(self):
+    def request(self, max_redirects=5):
+        # Check if the URL is cached and still valid
+        if self.scheme in ["http", "https"]:
+            cache_key = f"{self.scheme}://{self.host}{self.path}"
+        else:
+            cache_key = ''    
+        
+        if cache_key in self.cache:
+            content, expiration = self.cache[cache_key]
+            if time.time() < expiration:
+                return content
+            
         if self.scheme == "file":
             if os.path.exists(self.file_path):
                 with open(self.file_path, 'r', encoding='utf8') as file:
@@ -69,33 +85,82 @@ class URL:
 
         request = f"GET {self.path} HTTP/1.1\r\n"
         request += f"Host: {self.host}\r\n"
-        request += "Connection: close\r\n"
+        request += "Accept-Encoding: gzip\r\n"
+        #request += "Connection: close\r\n"
         request += "User-Agent: Martin\r\n"
         request += "\r\n"
-        s.send(request.encode("utf8"))
 
-        response = s.makefile("r", encoding="utf8", newline="\r\n")
-        statusline = response.readline()
-        version, status, explanation = statusline.split(" ", 2)
+        try:
+            s.send(request.encode("utf8"))
 
-        response_headers = {}
-        while True:
-            line = response.readline()
-            if line == "\r\n": break
-            header, value = line.split(":", 1)
-            response_headers[header.casefold()] = value.strip()
-        
-        assert "transfer-encoding" not in response_headers
-        assert "content-encoding" not in response_headers
+            response = s.makefile("rb", encoding="utf8", newline="\r\n")
+            statusline = response.readline().decode("utf8")
+            version, status, explanation = statusline.split(" ", 2)
 
-        content = response.read()
-        s.close()
+            response_headers = {}
+            while True:
+                line = response.readline().decode("utf8")
+                if line == "\r\n": break
+                header, value = line.split(":", 1)
+                response_headers[header.casefold()] = value.strip()
+            
+            # Check for Transfer-Encoding
+            transfer_encoding = response_headers.get("transfer-encoding", "")
+            content = b""
 
-        if self.view_source:
-            content = content.replace("<", "&lt;")
-            content = content.replace(">", "&gt;")
+            if transfer_encoding == "chunked":
+                while True:
+                    chunk_size_line = response.readline().strip()
+                    if not chunk_size_line:
+                        break # No more chunks
+                    chunk_size = int(chunk_size_line, 16)
+                    if chunk_size == 0:
+                        break # Last chunk
+                    chunk = response.read(chunk_size)
+                    content += chunk
+                    # Read the trailing CRLF after the chunk
+                    response.readline()
+            else:
+                content_length = int(response_headers.get("content-length", 0))
+                content = response.read(content_length)
 
-        return content
+            content_encoding = response_headers.get("content-encoding", "")
+            if content_encoding == "gzip":
+                content = gzip.decompress(content).decode("utf8")
+
+            # Handle redirection logic
+            if 300 <= int(status) <= 400:
+                if max_redirects <= 0:
+                    raise Exception("Too many redirects")
+                
+                new_url = response_headers.get("location")
+                if new_url:
+                    new_url = urljoin(f"{self.scheme}://{self.host}", new_url)
+                    redirected_url = URL(new_url)
+                    return redirected_url.request(max_redirects=max_redirects-1)           
+
+            # Check the Cache-Control header for caching directives
+            cache_control = response_headers.get("cache_control", "").lower()
+            if "no-store" in cache_control:
+                # Do not cache this response
+                pass
+            elif "max-age" in cache_control:
+                max_age = int(cache_control.split('max-age=')[-1].split(",")[0])
+                expiration = time.time() + max_age
+                self.cache[cache_key] = (content, expiration)
+            else:
+                # Other cache-control derivatives: do not cache
+                pass
+
+            if self.view_source:
+                content = content.replace("<", "&lt;")
+                content = content.replace(">", "&gt;")
+
+            return content
+        except OSError as e:
+            print(f"Socke error: {e}")
+            s.close()
+            return None
 
 """
 parameters:
@@ -146,16 +211,16 @@ def load(url):
     body = url.request()
     show(body)
 
-# if __name__ == "__main__":
-#     import sys
-#     if len(sys.argv) > 1:
-#         load(URL(sys.argv[1]))
-#     else:
-#         load(URL("file://D:/Martin/Projects/Browser/default.txt"))
-
 if __name__ == "__main__":
     import sys
-    load(URL("view-source:http://example.org/"))
+    if len(sys.argv) > 1:
+        load(URL(sys.argv[1]))
+    else:
+        load(URL("file://D:/Martin/Projects/Browser/default.txt"))
+
+# if __name__ == "__main__":
+#     import sys
+#     load(URL("http://example.org/"))
 
 
 # Test URL's
@@ -165,5 +230,6 @@ if __name__ == "__main__":
 # https://browser.engineering/examples/example1-simple.html
 # file://D:/Martin/Projects/Browser/example.txt
 # view-source:http://example.org/
+# http://browser.engineering/redirect
 
 
