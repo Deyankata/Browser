@@ -177,6 +177,7 @@ def add_headers(request, headers: dict):
 WIDTH, HEIGHT = 800, 600
 HSTEP, VSTEP = 13, 18
 SCROLL_STEP = 100
+SCROLL_HEIGHT = 100
 
 class Browser:
     
@@ -228,20 +229,44 @@ class Browser:
             self.scrolldown(e)
 
     def scrolldown(self, e):
-        self.scroll += SCROLL_STEP
-        self.draw()
-    
+        # Get last display list element in order to get the position at the end of the page
+        _, y, _ = self.display_list[-1]
+        if y - self.scroll > HEIGHT - VSTEP: # Prevents scrolling beyond the last display list element
+            self.scroll += SCROLL_STEP
+            self.draw()
+
     def scrollup(self, e):
         if self.scroll != 0:
             self.scroll -= SCROLL_STEP
             self.draw()
 
+    def draw_scrollbar(self):
+        # Get last element of display list to get the content height
+        _, y, _ = self.display_list[-1]
+
+        # If the whole content fits onscreen
+        if y < HEIGHT:
+            return
+
+        # Calculate the size of the scrollbar
+        content_height = y
+        viewport_height = HEIGHT
+        scrollbar_height = SCROLL_HEIGHT
+        thumb_size = max(((viewport_height / content_height) * scrollbar_height), 20)
+
+        # Calculate the scrollbar position
+        scroll_fraction = self.scroll / (content_height - viewport_height)
+        thumb_position = scroll_fraction * (viewport_height - thumb_size)
+
+        self.canvas.create_rectangle(WIDTH - 5, thumb_position, WIDTH, thumb_position + thumb_size, fill='blue')
+
     def draw(self):
         self.canvas.delete("all")
+        self.draw_scrollbar()
         for x,y,c in self.display_list:
-            if y > self.scroll + HEIGHT: continue
-            if y + VSTEP < self.scroll: continue
-            self.canvas.create_text(x, y - self.scroll, text=c)
+            if y > self.scroll + HEIGHT: continue   # skip items below the visible area
+            if y + VSTEP < self.scroll: continue    # skip items above the visible area
+            self.canvas.create_text(x, y-self.scroll, text=c)
     
     def load(self, url):
         body = url.request()
@@ -253,7 +278,7 @@ def layout(text):
     display_list = []
     cursor_x, cursor_y = HSTEP, VSTEP
     for c in text:
-        if  c == "\n":   # 
+        if  c == "\n":   # New line, move the cursor down
             cursor_x = HSTEP
             cursor_y += VSTEP + 2
         else:
@@ -262,7 +287,7 @@ def layout(text):
 
         if cursor_x >= WIDTH - HSTEP:
             cursor_y += VSTEP
-            cursor_x = HSTEP            
+            cursor_x = HSTEP
     return display_list
 
 def lex(body):
@@ -304,6 +329,10 @@ if __name__ == "__main__":
     Browser().load(URL(sys.argv[1]))
     tkinter.mainloop()
 
+# if __name__ == "__main__":
+#     import sys
+#     Browser().load(URL("https://browser.engineering/examples/xiyouji.html"))
+#     tkinter.mainloop()
 
 # Test URL's
 
