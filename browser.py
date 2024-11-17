@@ -192,12 +192,23 @@ def add_headers(request, headers: dict):
 
 
 class Text:
-    def __init__(self, text):
+    def __init__(self, text, parent):
         self.text = text
+        self.children = []  # Added for consistency, text node never have children
+        self.parent = parent
 
-class Tag:
-    def __init__(self, tag):
+    def __repr__(self):
+        return repr(self.text)
+
+class Element:
+    def __init__(self, tag, attributes, parent):
         self.tag = tag
+        self.attributes = attributes
+        self.children = []
+        self.parent = parent
+    
+    def __repr__(self):
+        return "<" + self.tag + ">"
 
 WIDTH, HEIGHT = 800, 600
 HSTEP, VSTEP = 13, 18
@@ -208,7 +219,7 @@ class Browser:
     
     def __init__(self):
         self.display_list = []
-        self.tokens = []
+        self.nodes = []
         self.window = tkinter.Tk()
         self.canvas = tkinter.Canvas(
             self.window,
@@ -238,7 +249,7 @@ class Browser:
     def on_resize(self, e):
         global WIDTH, HEIGHT
         WIDTH, HEIGHT = e.width, e.height
-        self.display_list = Layout(self.tokens).display_list
+        self.display_list = Layout(self.nodes, WIDTH).display_list
         self.draw()
 
     def on_mouse_scroll(self, e):
@@ -298,14 +309,133 @@ class Browser:
         if body == "about:blank":
             self.canvas = tkinter.Canvas(self.window, width=WIDTH, height=HEIGHT, bg="white")
             self.canvas.pack(fill=tkinter.BOTH, expand=True)
-        self.tokens = lex(body)
-        self.display_list = Layout(self.tokens, WIDTH).display_list
+        self.nodes = HTMLParser(body).parse()
+        self.display_list = Layout(self.nodes, WIDTH).display_list
         self.draw()
 
+class HTMLParser:
+    SELF_CLOSING_TAGS = [
+    "area", "base", "br", "col", "embed", "hr", "img", "input",
+    "link", "meta", "param", "source", "track", "wbr"
+    ]
+
+    HEAD_TAGS = [
+        "base", "basefont", "bgsound", "noscript",
+        "link", "meta", "title", "style", "script",
+    ]
+    
+    def __init__(self, body):
+        self.body = body
+        self.unfinished = []
+    
+    def parse(self):
+        text = ""
+        in_tag = False
+
+        i = 0
+        while i < len(self.body):
+            if self.body[i] == "<":
+                in_tag = True
+                if text: self.add_text(text)
+                text = ""
+                i += 1
+            elif self.body[i] == ">":
+                in_tag = False
+                self.add_tag(text)
+                text = ""
+                i += 1
+            elif self.body[i] == "&" and not in_tag:  # Check if the next sequence is an entity (&lt; or &gt;)
+                if is_entity(self.body[i:i+4]):
+                    if self.body[i+1] =="l":
+                        text += "<"
+                    else:
+                        text += ">"
+                    i += 4   # Skip entity by incrementing index
+                else:
+                    text += "&"
+                    i += 1
+            else:
+                text += self.body[i]
+                i += 1
+        if not in_tag and text:
+            self.add_text(text)
+            i += 1
+        
+        return self.finish()
+    
+    def add_text(self, text):
+        if text.isspace(): return
+        self.implicit_tags(None)
+        parent = self.unfinished[-1]
+        node = Text(text, parent)
+        parent.children.append(node)
+    
+    def add_tag(self, tag):
+        tag, attributes = self.get_attributes(tag)
+        if tag.startswith("!"): return
+        self.implicit_tags(tag)
+
+        if tag.startswith("/"):
+            if len(self.unfinished) == 1: return   # no unfinished node can be added to very last tag
+            node = self.unfinished.pop()
+            parent = self.unfinished[-1]
+            parent.children.append(node)
+        elif tag in self.SELF_CLOSING_TAGS:
+            parent = self.unfinished[-1]
+            node = Element(tag, attributes, parent)
+            parent.children.append(node)
+        else:
+            parent = self.unfinished[-1] if self.unfinished else None  # very first tag doesn't have a parent
+            node = Element(tag, attributes, parent)
+            self.unfinished.append(node)
+    
+    def finish(self):
+        if not self.unfinished:
+            self.implicit_tags(None)
+
+        while len(self.unfinished) > 1:
+            node = self.unfinished.pop()
+            parent = self.unfinished[-1]
+            parent.children.append(node)
+        return self.unfinished.pop()
+    
+    def get_attributes(self, text):
+        parts = text.split()
+        tag = parts[0].casefold()
+        attributes = {}
+        for attrpair in parts[1:]:
+            if "=" in attrpair:
+                key, value = attrpair.split("=", 1)
+                attributes[key.casefold()] = value
+                if len(value) > 2 and value[0] in ["'", "\""]:
+                    value = value[1:-1]   # remove quotes around attribute
+            else:
+                attributes[attrpair.casefold()] = ""
+        return tag, attributes
+
+    def implicit_tags(self, tag):
+        while True:
+            open_tags = [node.tag for node in self.unfinished]
+            if open_tags == [] and tag != "html":
+                self.add_tag("html")
+            elif open_tags == ["html"] \
+                and tag not in ["head", "body", "/html"]:
+                if tag in self.HEAD_TAGS:
+                    self.add_tag("head")
+                else:
+                    self.add_tag("body")
+            elif open_tags == ["html", "head"] and \
+                tag not in ["/head"] + self.HEAD_TAGS:
+                self.add_tag("/head")
+            else:
+                break
+
+
 FONTS = {}
+SUPERSCRIPT_OFFSET = 5
 
 class Layout:
-    def __init__(self, tokens, canvas_width):
+    def __init__(self, nodes, canvas_width):
         self.display_list = []
         self.line = []
         self.cursor_x = HSTEP
@@ -315,71 +445,107 @@ class Layout:
         self.style = "roman"
         self.size = 12
         self.center_next_text = False # Flag for centering text
+        self.superscript = False      # Flag for superscript
+        self.small_caps = False       # Flag for small caps
+        self.small_caps_size = 8
 
-        for tok in tokens:
-            self.token(tok)
+        self.recurse(nodes)
         
         self.flush()
     
-    def token(self, tok):
-        if isinstance(tok, Text):
-            if self.center_next_text:
-                self.center_text(tok.text)     # Center this token's text
-                self.center_next_text = False  # Reset the flag
-            else:
-                for word in tok.text.split():
-                    self.word(word)
-        elif tok.tag == "i":
+    def open_tag(self, tag):
+        if tag == "i":
             self.style = "italic"
-        elif tok.tag == "/i":
-            self.style = "roman"
-        elif tok.tag == "b":
+        elif tag == "b":
             self.weight = "bold"
-        elif tok.tag == "/b":
-            self.weight = "normal"
-        elif tok.tag == "small":
+        elif tag == "small":
             self.size -= 2
-        elif tok.tag == "/small":
-            self.size += 2
-        elif tok.tag == "big":
+        elif tag == "big":
             self.size += 4
-        elif tok.tag == "/big":
-            self.size -= 4
-        elif tok.tag == "br":
+        elif tag == "br":
             self.flush()
-        elif tok.tag == "/p":
+        elif tag == "h1 class=\"title\"":
+            self.flush() # End the current line before centering
+            self.center_next_text = True  # Set flag to center the next text tag
+        elif tag == "sup":
+            self.size = int(self.size / 2)
+            self.superscript = True
+        elif tag == "abbr":
+            self.small_caps = True
+    
+    def close_tag(self, tag):
+        if tag == "i":
+            self.style = "roman"  
+        elif tag == "b":
+            self.weight = "normal"
+        elif tag == "small":
+            self.size += 2
+        elif tag == "big":
+            self.size -= 4
+        elif tag == "p":
             self.flush()
             self.cursor_y += VSTEP
-        elif tok.tag == "h1 class=\"title\"":
-            self.flush() # End the current line before centering
-            self.center_next_text = True  # Set flag to center the next text token
-        elif tok.tag == "/h1":
+        elif tag == "h1":
             self.flush()
             self.cursor_x = HSTEP
+        elif tag == "sup":
+            self.size *= 2
+            self.superscript = False
+        elif tag == "abbr":
+            self.small_caps = False
+    
+    def recurse(self, tree):
+        if isinstance(tree, Text):
+            if self.center_next_text:
+                self.center_text(tree.text)     # Center this token's text
+                self.center_next_text = False  # Reset the flag
+            else:
+                for word in tree.text.split():
+                    self.word(word)
+        else:
+            self.open_tag(tree.tag)
+            for child in tree.children:
+                self.recurse(child)
+            self.close_tag(tree.tag)
     
     def word(self, word):
         font = get_font(self.size, self.weight, self.style)
         w = font.measure(word)
 
+        if self.small_caps: 
+            word, font = self.apply_small_caps(word, font)
+
         if self.cursor_x + w > WIDTH - HSTEP:
-            self.flush()
+            if check_hyphen(word):
+                self.hyphen_word(word, font)
+                return
+            else:
+                self.flush()
+                
+        # If the word contains hyphen encodings, remove them when hyphenation is not necessary
+        if check_hyphen(word):
+            word_hypen_slit = word.split("\N{SOFT HYPHEN}")
+            word = "".join(word_hypen_slit)
 
         if  word == "\n":   # New line, move the cursor down
             self.cursor_x = HSTEP
             self.cursor_y += VSTEP + 2
         else:
-            self.line.append((self.cursor_x, word, font))
+            self.line.append((self.cursor_x, word, self.superscript, font))
             self.cursor_x += w + font.measure(" ")
     
     def flush(self):
         if not self.line: return
-        metrics = [font.metrics() for x, word, font in self.line]
+        metrics = [font.metrics() for _, _, _, font in self.line]
         max_ascent = max([metric["ascent"] for metric in metrics])
 
         baseline = self.cursor_y + 1.25 * max_ascent
 
-        for x, word, font in self.line:
-            y = baseline - font.metrics("ascent")
+        for x, word, superscript, font in self.line:
+            if superscript:
+                y = baseline - font.metrics("ascent") - SUPERSCRIPT_OFFSET
+            else:
+                y = baseline - font.metrics("ascent")
             self.display_list.append((x, y, word, font))
         
         max_descent = max([metric["descent"] for metric in metrics])
@@ -392,8 +558,51 @@ class Layout:
         font = get_font(self.size, self.weight, self.style)
         text_width = font.measure(text)
         self.cursor_x = (self.canvas_width - text_width) // 2
-        self.line.append((self.cursor_x, text, font))
+        self.line.append((self.cursor_x, text, self.superscript, font))
         self.flush()  # Finish the centered text line
+    
+    def hyphen_word(self, word, font):
+        # Split the word into parts by soft hyphen positions
+        word_parts = word.split("\N{SOFT HYPHEN}")
+        best_split_index = None
+        best_fit_size = float('inf') 
+
+        # Try breaking at each soft hyphen
+        for i in range(1, len(word_parts) + 1):
+            first_part = "".join(word_parts[:i]) + "-" 
+            first_part_size = font.measure(first_part)
+            
+            # If this fits and is the closest to max_width, use it
+            if first_part_size + self.cursor_x + HSTEP <= WIDTH and WIDTH - (first_part_size + self.cursor_x + HSTEP) < best_fit_size:
+                best_split_index = i
+                best_fit_size = WIDTH - (first_part_size + self.cursor_x + HSTEP)
+
+        # If no valid split was found, use the longest possible
+        if best_split_index is None:
+            best_split_index = 1  # Fallback to the first split
+        
+        # Get the parts of the word based on the best split
+        first_part = "".join(word_parts[:best_split_index]) + "-"
+        second_part = "".join(word_parts[best_split_index:])
+
+        # Update cursor and draw first part
+        self.line.append((self.cursor_x, first_part, self.superscript, font))
+        first_part_size = font.measure(first_part)
+        self.cursor_x += first_part_size
+        
+        self.flush()
+
+        # Draw the second part on the new line
+        self.line.append((self.cursor_x, second_part, self.superscript, font))
+
+    def  apply_small_caps(self, word, font):
+        if word.islower():
+            small_caps_font = get_font(self.small_caps_size, "bold", self.style)
+            word = word.upper()
+            return word, small_caps_font
+        else:
+            return word, font
+
 
 def get_font(size, weight, style):
     key = (size, weight, style)
@@ -403,54 +612,27 @@ def get_font(size, weight, style):
         FONTS[key] = (font, label)
     return FONTS[key][0]
 
-def lex(body):
-    out = []
-    buffer = ""
-    in_tag = False
-
-    i = 0
-    while i < len(body):
-        if body[i] == "<":
-            in_tag = True
-            if buffer: out.append(Text(buffer))
-            buffer = ""
-            i += 1
-        elif body[i] == ">":
-            in_tag = False
-            out.append(Tag(buffer))
-            buffer = ""
-            i += 1
-        elif body[i] == "&" and not in_tag:  # Check if the next sequence is an entity (&lt; or &gt;)
-            if is_entity(body[i:i+4]):
-                if body[i+1] =="l":
-                    buffer += "<"
-                else:
-                    buffer += ">"
-                i += 4   # Skip entity by incrementing index
-            else:
-                buffer += "&"
-                i += 1
-        else:
-            buffer += body[i]
-            i += 1
-    if not in_tag and buffer:
-        out.append(Text(buffer))
-        i += 1
-    
-    return out
+def print_tree(node, indent=0):
+    print(" " * indent, node)
+    for child in node.children:
+        print_tree(child, indent + 2)
 
 def is_entity(text):
     return text == "&lt;" or text == "&gt;"
 
-# if __name__ == "__main__":
-#     import sys
-#     Browser().load(URL(sys.argv[1]))
-#     tkinter.mainloop()
+def check_hyphen(word):
+    return "\N{SOFT HYPHEN}" in word
 
 if __name__ == "__main__":
     import sys
-    Browser().load(URL("https://browser.engineering/text.html"))
+    Browser().load(URL(sys.argv[1]))
     tkinter.mainloop()
+
+# if __name__ == "__main__":
+#     import sys
+#     Browser().load(URL("file://D:/Martin/Projects/Browser/example.txt"))
+#     tkinter.mainloop()
+
 
 # Test URL's
 
@@ -461,6 +643,8 @@ if __name__ == "__main__":
 # view-source:http://example.org/
 # http://browser.engineering/redirect
 # https://browser.engineering/examples/example3-sizes.html
+# https://browser.engineering/html.html
+# https://browser.engineering/
 
 # Journey to the West
 # https://browser.engineering/examples/xiyouji.html
