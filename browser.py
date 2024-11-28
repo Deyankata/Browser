@@ -331,20 +331,31 @@ class HTMLParser:
     def parse(self):
         text = ""
         in_tag = False
+        in_comment = False
 
         i = 0
         while i < len(self.body):
             if self.body[i] == "<":
+                # Check if it's a comment
+                if self.body[i: i+4] == "<!--":
+                    i += 4  # Skip comment's opening sequence
+                    in_comment = True
+                    continue
+
                 in_tag = True
                 if text: self.add_text(text)
                 text = ""
                 i += 1
-            elif self.body[i] == ">":
+            elif self.body[i:i+3] == "-->" and in_comment:
+                in_comment = False
+                i += 3
+                continue
+            elif self.body[i] == ">" and not in_comment:
                 in_tag = False
                 self.add_tag(text)
                 text = ""
                 i += 1
-            elif self.body[i] == "&" and not in_tag:  # Check if the next sequence is an entity (&lt; or &gt;)
+            elif self.body[i] == "&" and not in_tag and not in_comment:  # Check if the next sequence is an entity (&lt; or &gt;)
                 if is_entity(self.body[i:i+4]):
                     if self.body[i+1] =="l":
                         text += "<"
@@ -354,9 +365,14 @@ class HTMLParser:
                 else:
                     text += "&"
                     i += 1
-            else:
+            elif not in_comment:
                 text += self.body[i]
                 i += 1
+            else:
+                if i == len(self.body)-1 and in_comment:
+                    raise Exception("Non-closed comment")
+                i+=1
+
         if not in_tag and text:
             self.add_text(text)
             i += 1
@@ -623,15 +639,15 @@ def is_entity(text):
 def check_hyphen(word):
     return "\N{SOFT HYPHEN}" in word
 
-if __name__ == "__main__":
-    import sys
-    Browser().load(URL(sys.argv[1]))
-    tkinter.mainloop()
-
 # if __name__ == "__main__":
 #     import sys
-#     Browser().load(URL("file://D:/Martin/Projects/Browser/example.txt"))
+#     Browser().load(URL(sys.argv[1]))
 #     tkinter.mainloop()
+
+if __name__ == "__main__":
+    import sys
+    Browser().load(URL("file://D:/Martin/Projects/Browser/example.txt"))
+    tkinter.mainloop()
 
 
 # Test URL's
