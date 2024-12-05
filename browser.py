@@ -215,7 +215,7 @@ HSTEP, VSTEP = 13, 18
 SCROLL_STEP = 100
 SCROLL_HEIGHT = 100
 
-class Browser:
+class Browser:  
     
     def __init__(self):
         self.display_list = []
@@ -249,7 +249,10 @@ class Browser:
     def on_resize(self, e):
         global WIDTH, HEIGHT
         WIDTH, HEIGHT = e.width, e.height
-        self.display_list = Layout(self.nodes, WIDTH).display_list
+        self.document = DocumentLayout(self.nodes)
+        self.document.layout()
+        self.display_list = []
+        paint_tree(self.document, self.display_list)
         self.draw()
 
     def on_mouse_scroll(self, e):
@@ -266,11 +269,11 @@ class Browser:
 
     def scrolldown(self, e):
         # Get last display list element in order to get the position at the end of the page
-        _, y, _, _ = self.display_list[-1]
+        y = self.display_list[-1].bottom
         if y - self.scroll > HEIGHT - VSTEP: # Prevents scrolling beyond the last display list element
             self.scroll += SCROLL_STEP
             self.draw()
-
+                    
     def scrollup(self, e):
         if self.scroll != 0:
             self.scroll -= SCROLL_STEP
@@ -278,7 +281,7 @@ class Browser:
 
     def draw_scrollbar(self):
         # Get last element of display list to get the content height
-        _, y, _, _ = self.display_list[-1]
+        y = self.display_list[-1].bottom
 
         # If the whole content fits onscreen
         if y < HEIGHT:
@@ -299,18 +302,21 @@ class Browser:
     def draw(self):
         self.canvas.delete("all")
         self.draw_scrollbar()
-        for x,y,c,f in self.display_list:
-            if y > self.scroll + HEIGHT: continue   # skip items below the visible area
-            if y + VSTEP < self.scroll: continue    # skip items above the visible area
-            self.canvas.create_text(x, y-self.scroll, text=c, anchor='nw', font=f)
-    
+        for cmd in self.display_list:
+            if cmd.top > self.scroll + HEIGHT: continue
+            if cmd.bottom < self.scroll: continue
+            cmd.execute(self.scroll, self.canvas)
+
     def load(self, url):
         body = url.request()
         if body == "about:blank":
             self.canvas = tkinter.Canvas(self.window, width=WIDTH, height=HEIGHT, bg="white")
             self.canvas.pack(fill=tkinter.BOTH, expand=True)
         self.nodes = HTMLParser(body).parse()
-        self.display_list = Layout(self.nodes, WIDTH).display_list
+        self.document = DocumentLayout(self.nodes)
+        self.document.layout()
+        self.display_list = []
+        paint_tree(self.document, self.display_list)
         self.draw()
 
 class HTMLParser:
@@ -450,12 +456,25 @@ class HTMLParser:
 FONTS = {}
 SUPERSCRIPT_OFFSET = 5
 
-class Layout:
-    def __init__(self, nodes, canvas_width):
+BLOCK_ELEMENTS = [
+        "html", "body", "article", "section", "nav", "aside", "h1", "h2", "h3", "h4", "h5", "h6", 
+        "hgroup", "header", "footer", "address", "p", "hr", "pre", "blockquote", "ol", "ul", "menu",
+        "li", "dl", "dt", "dd", "figure", "figcaption", "main", "div", "table", "form", "fieldset",
+        "legend", "details", "summary"
+    ]
+class BlockLayout:
+
+    def __init__(self, node, parent, previous, canvas_width):
+        self.node = node
+        self.parent = parent
+        self.previous = previous
+        self.children = []
+        self.x = None
+        self.y = None
+        self.width = None
+        self.height = None
         self.display_list = []
         self.line = []
-        self.cursor_x = HSTEP
-        self.cursor_y = VSTEP
         self.canvas_width = canvas_width
         self.weight = "normal"
         self.style = "roman"
@@ -464,11 +483,53 @@ class Layout:
         self.superscript = False      # Flag for superscript
         self.small_caps = False       # Flag for small caps
         self.small_caps_size = 8
-
-        self.recurse(nodes)
-        
-        self.flush()
     
+    def layout(self):
+        self.x = self.parent.x
+        self.width = self.parent.width
+
+        if self.previous:
+            self.y = self.previous.y + self.previous.height
+        else:
+            self.y = self.parent.y
+        
+        mode = self.layout_mode()
+        if mode == "block":
+            previous = None
+            for child in self.node.children:
+                next = BlockLayout(child, self, previous, WIDTH)
+                self.children.append(next)
+                previous = next
+        else:
+            self.cursor_x = 0
+            self.cursor_y = 0
+            self.weight = "normal"
+            self.style = "roman"
+            self.size = 12
+
+            self.line = []
+            self.recurse(self.node)
+            self.flush()
+
+        for child in self.children:
+            child.layout()
+        
+        if mode == "block":
+            self.height = sum([child.height for child in self.children])
+        else:
+            self.height = self.cursor_y
+
+    def layout_mode(self):
+        if isinstance(self.node, Text):
+            return "inline"
+        elif any([isinstance(child, Element) and \
+                  child.tag in BLOCK_ELEMENTS for child in self.node.children]):
+            return "block"
+        elif self.node.children:
+            return "inline"
+        else:
+            return "block"
+
     def open_tag(self, tag):
         if tag == "i":
             self.style = "italic"
@@ -531,7 +592,7 @@ class Layout:
         if self.small_caps: 
             word, font = self.apply_small_caps(word, font)
 
-        if self.cursor_x + w > WIDTH - HSTEP:
+        if self.cursor_x + w > self.width:
             if check_hyphen(word):
                 self.hyphen_word(word, font)
                 return
@@ -557,18 +618,33 @@ class Layout:
 
         baseline = self.cursor_y + 1.25 * max_ascent
 
-        for x, word, superscript, font in self.line:
+        for rel_x, word, superscript, font in self.line:
+            x = self.x + rel_x
             if superscript:
                 y = baseline - font.metrics("ascent") - SUPERSCRIPT_OFFSET
             else:
-                y = baseline - font.metrics("ascent")
+                y = self.y + baseline - font.metrics("ascent")
             self.display_list.append((x, y, word, font))
         
+        self.cursor_x = 0
+        self.line = []
+
         max_descent = max([metric["descent"] for metric in metrics])
         self.cursor_y = baseline + 1.25 * max_descent
+        
+    def paint(self):
+        cmds = []
+        
+        if isinstance(self.node, Element) and self.node.tag == "pre":
+            x2, y2 = self.x + self.width, self.y + self.height
+            rect = DrawRect(self.x, self.y, x2, y2, "gray")
+            cmds.append(rect)
 
-        self.cursor_x = HSTEP
-        self.line = []
+        if self.layout_mode() == "inline":
+            for x, y, word, font in self.display_list:
+                cmds.append(DrawText(x, y, word, font))
+
+        return cmds
 
     def center_text(self, text):
         font = get_font(self.size, self.weight, self.style)
@@ -619,6 +695,60 @@ class Layout:
         else:
             return word, font
 
+class DocumentLayout:
+    def __init__(self, node):
+        self.node = node
+        self.parent = None
+        self.children = []
+        self.x = None
+        self.y = None
+        self.width = None
+        self.height = None
+    
+    def layout(self):
+        child = BlockLayout(self.node, self, None, WIDTH)
+        self.children.append(child)
+        self.width = WIDTH - 2*HSTEP
+        self.x = HSTEP
+        self.y = VSTEP
+        child.layout()
+        self.height = child.height
+
+    def paint(self):
+        return []
+
+class DrawText:
+    def __init__(self, x1, y1, text, font):
+        self.top = y1
+        self.left = x1
+        self.text = text
+        self.font = font
+        self.bottom = y1 + font.metrics("linespace")
+
+    def execute(self, scroll, canvas):
+        canvas.create_text(
+            self.left, self.top - scroll,
+            text=self.text,
+            font=self.font,
+            anchor='nw'
+        )
+
+class DrawRect:
+    def __init__(self, x1, y1, x2, y2, color):
+        self.top = y1
+        self.left = x1
+        self.bottom = y2
+        self.right = x2
+        self.color = color
+    
+    def execute(self, scroll, canvas):
+        canvas.create_rectangle(
+            self.left, self.top - scroll,
+            self.right, self.bottom - scroll,
+            width=0,
+            fill=self.color
+        )
+
 
 def get_font(size, weight, style):
     key = (size, weight, style)
@@ -627,6 +757,12 @@ def get_font(size, weight, style):
         label = tkinter.Label(font=font)
         FONTS[key] = (font, label)
     return FONTS[key][0]
+
+def paint_tree(layout_object, display_list):
+    display_list.extend(layout_object.paint())
+
+    for child in layout_object.children:
+        paint_tree(child, display_list)
 
 def print_tree(node, indent=0):
     print(" " * indent, node)
@@ -646,7 +782,7 @@ def check_hyphen(word):
 
 if __name__ == "__main__":
     import sys
-    Browser().load(URL("file://D:/Martin/Projects/Browser/example.txt"))
+    Browser().load(URL("https://browser.engineering/layout.html"))
     tkinter.mainloop()
 
 
