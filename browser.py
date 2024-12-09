@@ -258,7 +258,7 @@ class Chrome:
         self.focus = None
         self.address_bar = ""
         
-        # New tab button and tab names
+        # New tab button 
         plus_width = self.font.measure("+") + 2*self.padding
         self.newtab_rect = Rect(
             self.padding, self.padding,
@@ -275,6 +275,7 @@ class Chrome:
             self.urlbar_bottom - self.padding
         )
 
+        # address bar
         self.address_rect = Rect(
             self.back_rect.top + self.padding,
             self.urlbar_top + self.padding,
@@ -284,10 +285,10 @@ class Chrome:
     
     def tab_rect(self, i):
         tabs_start = self.newtab_rect.right + self.padding
-        tab_wdith = self.font.measure("Tab X") + 2*self.padding
+        tab_width = self.font.measure("Tab X") + 2*self.padding
         return Rect(
-            tabs_start + tab_wdith * i, self.tabbar_top,
-            tabs_start + tab_wdith * (i+1), self.tabbar_bottom
+            tabs_start + tab_width * i, self.tabbar_top,
+            tabs_start + tab_width * (i+1), self.tabbar_bottom
         )
     
     def click(self, x, y):
@@ -313,6 +314,10 @@ class Chrome:
         if self.focus == "address bar":
             self.browser.active_tab.load(URL(self.address_bar))
             self.focus = None
+
+    def backspace(self):
+        if self.focus == "address bar" and len(self.address_bar) > 0:
+            self.address_bar = self.address_bar[:-1]  # Create a new string by cutting the last letter of the old one
 
     def paint(self):
         cmds = []
@@ -431,6 +436,8 @@ class Browser:
         self.window.bind("<Button-1>", self.handle_click)
         self.window.bind("<Key>", self.handle_key)
         self.window.bind("<Return>", self.handle_enter)
+        self.window.bind("<BackSpace>", self.handle_backspace)
+        self.window.bind("<Button-2>", self.handle_click)
 
     def new_tab(self, url):
         new_tab = Tab(HEIGHT - self.chrome.bottom)
@@ -465,7 +472,10 @@ class Browser:
             self.chrome.click(e.x, e.y)
         else:
             tab_y = e.y - self.chrome.bottom
-            self.active_tab.click(e.x, tab_y)
+            if e.num == 1:    # Left click
+                self.active_tab.click(e.x, tab_y, mid_click=False)
+            elif e.num == 2:  # Middle click
+                self.new_tab(self.active_tab.click(e.x, tab_y, mid_click=True)) 
         self.draw()
     
     def handle_key(self, e):
@@ -476,6 +486,10 @@ class Browser:
     
     def handle_enter(self, e):
         self.chrome.enter()
+        self.draw()
+
+    def handle_backspace(self, e):
+        self.chrome.backspace()
         self.draw()
     
     def draw(self):
@@ -519,7 +533,7 @@ class Tab:
 
         canvas.create_rectangle(WIDTH - 5, thumb_position + tab_offset, WIDTH, thumb_position + thumb_size + tab_offset, fill='blue')
 
-    def click(self, x, y):
+    def click(self, x, y, mid_click=False):
         # Account for scrolling
         y += self.scroll
 
@@ -534,7 +548,10 @@ class Tab:
                 pass
             elif elt.tag == "a" and "href" in elt.attributes:
                 url = self.url.resolve(elt.attributes["href"])
-                return self.load(url)
+                if mid_click:   # If middle click is pressed, return url to Browser, to open a new tab
+                    return url
+                else:
+                    return self.load(url)
             elt = elt.parent
 
     def on_mouse_scroll(self, e):
@@ -572,13 +589,18 @@ class Tab:
             self.load(back)
 
     def load(self, url):
+        # Get website body
         self.history.append(url)
         self.url = url
         body = url.request()
         if body == "about:blank":
             self.canvas = tkinter.Canvas(self.window, width=WIDTH, height=HEIGHT, bg="white")
             self.canvas.pack(fill=tkinter.BOTH, expand=True)
+        
+        # Parse html tree
         self.nodes = HTMLParser(body).parse()
+        
+        # Apply styles
         rules = DEFAULT_STYLE_SHEET.copy()
         links = [node.attributes["href"]
                  for node in tree_to_list(self.nodes, [])
@@ -594,6 +616,8 @@ class Tab:
                 continue
             rules.extend(CSSParser(body).parse())
         style(self.nodes, sorted(rules, key=cascade_priority))
+
+        # Layout nodes and print
         self.document = DocumentLayout(self.nodes)
         self.document.layout()
         self.display_list = []
